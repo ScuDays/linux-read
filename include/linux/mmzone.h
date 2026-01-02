@@ -876,15 +876,27 @@ enum zone_type {
 
 #define ASYNC_AND_SYNC 2
 
+/* 
+ * 【中文】内存区域（zone）结构体
+ * 
+ * Linux 将物理内存划分为多个区域（zones），如 DMA、NORMAL、HIGHMEM 等。
+ * 这个结构体描述了一个内存区域的所有属性和状态。
+ * 
+ * 结构体按照访问频率分组，使用缓存行填充（CACHELINE_PADDING）来避免伪共享。
+ */
 struct zone {
 	/* Read-mostly fields */
+	/* 【中文】只读密集字段 - 这些字段主要被读取，很少被修改，放在一起提高缓存效率 */
 
 	/* zone watermarks, access with *_wmark_pages(zone) macros */
+	/* 【中文】水位线标记 - 用于判断内存压力，包括 WMARK_MIN/LOW/HIGH 三个等级
+	 * 使用 *_wmark_pages(zone) 宏来访问，用于触发内存回收等操作 */
 	unsigned long _watermark[NR_WMARK];
-	unsigned long watermark_boost;
+	unsigned long watermark_boost;  /* 【中文】水位线提升值 - 临时提高水位线以加速内存回收 */
 
-	unsigned long nr_reserved_highatomic;
-	unsigned long nr_free_highatomic;
+	/* 【中文】高原子性（HIGHATOMIC）保留页面 - 为紧急的原子性分配预留的内存 */
+	unsigned long nr_reserved_highatomic;  /* 【中文】保留的高原子性页面数 */
+	unsigned long nr_free_highatomic;      /* 【中文】空闲的高原子性页面数 */
 
 	/*
 	 * We don't know if the memory that we're going to allocate will be
@@ -895,31 +907,39 @@ struct zone {
 	 * recalculated at runtime if the sysctl_lowmem_reserve_ratio sysctl
 	 * changes.
 	 */
+	/* 【中文】低端内存保留数组 - 为每个更低的 zone 保留一定内存
+	 * 防止高端 zone 的分配请求耗尽低端 zone 的内存，导致低端 zone OOM
+	 * 例如：NORMAL zone 为 DMA zone 保留一些页面
+	 * 可通过 sysctl_lowmem_reserve_ratio 调整 */
 	long lowmem_reserve[MAX_NR_ZONES];
 
 #ifdef CONFIG_NUMA
-	int node;
+	int node;  /* 【中文】NUMA 节点 ID - 该 zone 所属的 NUMA 节点编号 */
 #endif
-	struct pglist_data	*zone_pgdat;
-	struct per_cpu_pages	__percpu *per_cpu_pageset;
-	struct per_cpu_zonestat	__percpu *per_cpu_zonestats;
+	struct pglist_data	*zone_pgdat;  /* 【中文】指向所属的 pglist_data (节点) 结构体 */
+	struct per_cpu_pages	__percpu *per_cpu_pageset;    /* 【中文】每 CPU 页面缓存 - 用于快速分配/释放单页 */
+	struct per_cpu_zonestat	__percpu *per_cpu_zonestats;  /* 【中文】每 CPU zone 统计信息 */
 	/*
 	 * the high and batch values are copied to individual pagesets for
 	 * faster access
 	 */
-	int pageset_high_min;
-	int pageset_high_max;
-	int pageset_batch;
+	/* 【中文】以下值被复制到每个 CPU 的 pageset 中以加快访问速度 */
+	int pageset_high_min;  /* 【中文】per-cpu 页面缓存的最小高水位 */
+	int pageset_high_max;  /* 【中文】per-cpu 页面缓存的最大高水位 */
+	int pageset_batch;     /* 【中文】批量分配/释放的页面数量 */
 
 #ifndef CONFIG_SPARSEMEM
 	/*
 	 * Flags for a pageblock_nr_pages block. See pageblock-flags.h.
 	 * In SPARSEMEM, this map is stored in struct mem_section
 	 */
+	/* 【中文】页块标志位 - 存储每个 pageblock 的迁移类型等标志
+	 * 在 SPARSEMEM 模式下，这些信息存储在 struct mem_section 中 */
 	unsigned long		*pageblock_flags;
 #endif /* CONFIG_SPARSEMEM */
 
 	/* zone_start_pfn == zone_start_paddr >> PAGE_SHIFT */
+	/* 【中文】zone 起始页帧号（PFN） - 该 zone 的第一个物理页面的页帧号 */
 	unsigned long		zone_start_pfn;
 
 	/*
@@ -964,17 +984,41 @@ struct zone {
 	 * mem_hotplug_begin/done(). Any reader who can't tolerant drift of
 	 * present_pages should use get_online_mems() to get a stable value.
 	 */
-	atomic_long_t		managed_pages;
-	unsigned long		spanned_pages;
-	unsigned long		present_pages;
+	/* 【中文】页面计数关系详解：
+	 * 
+	 * 1. spanned_pages（跨越页面数）：zone 覆盖的总页面数，包括内存空洞
+	 *    计算公式：spanned_pages = zone_end_pfn - zone_start_pfn
+	 * 
+	 * 2. present_pages（实际存在页面数）：zone 中真实存在的物理页面数
+	 *    计算公式：present_pages = spanned_pages - absent_pages（空洞中的页面）
+	 * 
+	 * 3. present_early_pages（早期存在页面数）：启动时就存在的页面，不包括热插拔内存
+	 * 
+	 * 4. managed_pages（伙伴系统管理页面数）：由伙伴系统管理的页面数
+	 *    计算公式：managed_pages = present_pages - reserved_pages（保留页面）
+	 *    这是实际可分配的页面数，用于计算水位线和阈值
+	 * 
+	 * 5. cma_pages（CMA 页面数）：分配给 CMA（连续内存分配器）的页面数
+	 * 
+	 * 使用场景：
+	 * - 内存热插拔：使用 (present_pages - managed_pages) 计算未管理页面
+	 * - 页面分配器：使用 managed_pages 计算水位线和阈值
+	 * 
+	 * 锁机制：
+	 * - zone_start_pfn 和 spanned_pages：由 span_seqlock 保护（seqlock 允许无锁读取）
+	 * - present_pages 的运行时写入：由 mem_hotplug_begin/done() 保护
+	 */
+	atomic_long_t		managed_pages;  /* 【中文】伙伴系统管理的页面数（原子操作） */
+	unsigned long		spanned_pages;  /* 【中文】zone 跨越的总页面数（含空洞） */
+	unsigned long		present_pages;  /* 【中文】zone 中实际存在的物理页面数 */
 #if defined(CONFIG_MEMORY_HOTPLUG)
-	unsigned long		present_early_pages;
+	unsigned long		present_early_pages;  /* 【中文】启动时存在的页面数（不含热插拔） */
 #endif
 #ifdef CONFIG_CMA
-	unsigned long		cma_pages;
+	unsigned long		cma_pages;  /* 【中文】CMA（连续内存分配器）使用的页面数 */
 #endif
 
-	const char		*name;
+	const char		*name;  /* 【中文】zone 的名字，如 "DMA", "Normal", "HighMem" */
 
 #ifdef CONFIG_MEMORY_ISOLATION
 	/*
@@ -982,40 +1026,60 @@ struct zone {
 	 * freepage counting problem due to racy retrieving migratetype
 	 * of pageblock. Protected by zone->lock.
 	 */
+	/* 【中文】隔离的页块数量 - 用于解决并发获取页块迁移类型时的空闲页面计数错误
+	 * 由 zone->lock 保护 */
 	unsigned long		nr_isolate_pageblock;
 #endif
 
 #ifdef CONFIG_MEMORY_HOTPLUG
 	/* see spanned/present_pages for more description */
+	/* 【中文】顺序锁 - 保护 spanned_pages 和 zone_start_pfn
+	 * 允许在分配路径中无锁读取，但写入很少发生 */
 	seqlock_t		span_seqlock;
 #endif
 
-	int initialized;
+	int initialized;  /* 【中文】zone 初始化标志 */
 
 	/* Write-intensive fields used from the page allocator */
+	/* 【中文】====== 缓存行分隔 ====== 
+	 * 页面分配器频繁写入的字段 - 使用缓存行填充避免与上面的只读字段产生伪共享 */
 	CACHELINE_PADDING(_pad1_);
 
 	/* free areas of different sizes */
+	/* 【中文】伙伴系统的核心数据结构 - 按阶（order）组织的空闲页面链表数组
+	 * free_area[0]: 单页（2^0 = 1 页）
+	 * free_area[1]: 2 页块（2^1 = 2 页）
+	 * ...
+	 * free_area[10]: 1024 页块（2^10 = 1024 页，通常是最大阶） */
 	struct free_area	free_area[NR_PAGE_ORDERS];
 
 #ifdef CONFIG_UNACCEPTED_MEMORY
 	/* Pages to be accepted. All pages on the list are MAX_PAGE_ORDER */
+	/* 【中文】待接受的页面列表 - 用于机密计算等场景，需要先"接受"页面才能使用
+	 * 列表中所有页面都是 MAX_PAGE_ORDER 大小的 */
 	struct list_head	unaccepted_pages;
 
 	/* To be called once the last page in the zone is accepted */
+	/* 【中文】清理工作 - 当 zone 中最后一个页面被接受后调用 */
 	struct work_struct	unaccepted_cleanup;
 #endif
 
 	/* zone flags, see below */
+	/* 【中文】zone 标志位 - 如 ZONE_BOOSTED_WATERMARK（水位线已提升）等 */
 	unsigned long		flags;
 
 	/* Primarily protects free_area */
+	/* 【中文】自旋锁 - 主要保护 free_area，是页面分配器的核心锁 */
 	spinlock_t		lock;
 
 	/* Pages to be freed when next trylock succeeds */
+	/* 【中文】延迟释放页面链表 - 当无法获取 zone->lock 时，页面先放入此链表
+	 * 下次成功获取锁时再释放（lock-less 链表，无需持锁操作） */
 	struct llist_head	trylock_free_pages;
 
 	/* Write-intensive fields used by compaction and vmstats. */
+	/* 【中文】====== 缓存行分隔 ======
+	 * 内存压缩（compaction）和 VM 统计使用的频繁写入字段 */
 	CACHELINE_PADDING(_pad2_);
 
 	/*
@@ -1023,15 +1087,22 @@ struct zone {
 	 * when reading the number of free pages to avoid per-cpu counter
 	 * drift allowing watermarks to be breached
 	 */
+	/* 【中文】per-cpu 计数器漂移标记 - 当空闲页面低于此值时，读取空闲页面数时会采取额外步骤
+	 * 避免 per-cpu 计数器漂移导致水位线被突破 */
 	unsigned long percpu_drift_mark;
 
 #if defined CONFIG_COMPACTION || defined CONFIG_CMA
 	/* pfn where compaction free scanner should start */
-	unsigned long		compact_cached_free_pfn;
+	/* 【中文】内存压缩相关字段：
+	 * 压缩器使用两个扫描器：
+	 * 1. 空闲页面扫描器（从 zone 末尾向前扫描）
+	 * 2. 可迁移页面扫描器（从 zone 开头向后扫描）
+	 * 这些字段缓存扫描器的位置，避免重复扫描 */
+	unsigned long		compact_cached_free_pfn;       /* 【中文】空闲页面扫描器的起始 PFN（缓存） */
 	/* pfn where compaction migration scanner should start */
-	unsigned long		compact_cached_migrate_pfn[ASYNC_AND_SYNC];
-	unsigned long		compact_init_migrate_pfn;
-	unsigned long		compact_init_free_pfn;
+	unsigned long		compact_cached_migrate_pfn[ASYNC_AND_SYNC];  /* 【中文】迁移扫描器起始 PFN（异步和同步两种模式） */
+	unsigned long		compact_init_migrate_pfn;      /* 【中文】迁移扫描器的初始 PFN */
+	unsigned long		compact_init_free_pfn;         /* 【中文】空闲扫描器的初始 PFN */
 #endif
 
 #ifdef CONFIG_COMPACTION
@@ -1041,22 +1112,29 @@ struct zone {
 	 * last failure is tracked with compact_considered.
 	 * compact_order_failed is the minimum compaction failed order.
 	 */
-	unsigned int		compact_considered;
-	unsigned int		compact_defer_shift;
-	int			compact_order_failed;
+	/* 【中文】内存压缩延迟机制 - 避免频繁尝试失败的压缩操作：
+	 * 当压缩失败后，接下来会跳过 (1 << compact_defer_shift) 次压缩尝试
+	 * 逐步增加延迟时间，避免浪费 CPU 资源 */
+	unsigned int		compact_considered;      /* 【中文】自上次失败以来尝试的压缩次数 */
+	unsigned int		compact_defer_shift;    /* 【中文】延迟移位值 - 失败次数越多，延迟越长 */
+	int			compact_order_failed;   /* 【中文】压缩失败的最小阶数 */
 #endif
 
 #if defined CONFIG_COMPACTION || defined CONFIG_CMA
 	/* Set to true when the PG_migrate_skip bits should be cleared */
+	/* 【中文】压缩跳过标志清除标记 - 设置为 true 时应清除 PG_migrate_skip 位
+	 * PG_migrate_skip 用于标记不可迁移的页块，避免重复扫描 */
 	bool			compact_blockskip_flush;
 #endif
 
-	bool			contiguous;
+	bool			contiguous;  /* 【中文】物理内存连续性标志 - 表示该 zone 的物理内存是否连续 */
 
 	CACHELINE_PADDING(_pad3_);
 	/* Zone statistics */
-	atomic_long_t		vm_stat[NR_VM_ZONE_STAT_ITEMS];
-	atomic_long_t		vm_numa_event[NR_VM_NUMA_EVENT_ITEMS];
+	/* 【中文】====== 缓存行分隔 ======
+	 * Zone 统计信息 - 各种计数器，用于追踪内存使用情况 */
+	atomic_long_t		vm_stat[NR_VM_ZONE_STAT_ITEMS];      /* 【中文】VM 统计计数器数组（原子操作） */
+	atomic_long_t		vm_numa_event[NR_VM_NUMA_EVENT_ITEMS];  /* 【中文】NUMA 事件计数器数组（原子操作） */
 } ____cacheline_internodealigned_in_smp;
 
 enum pgdat_flags {
