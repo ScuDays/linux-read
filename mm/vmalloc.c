@@ -689,14 +689,63 @@ int vmap_pages_range_noflush(unsigned long addr, unsigned long end,
 	return __vmap_pages_range_noflush(addr, end, prot, pages, page_shift);
 }
 
+/*
+ * __vmap_pages_range - 将物理页面映射到内核虚拟地址空间（vmalloc 内部使用）
+ * @addr: 虚拟地址范围起始地址（必须是页对齐的）
+ * @end: 虚拟地址范围结束地址（非包含，必须是页对齐的）
+ * @prot: 页保护标志（如 PAGE_KERNEL，定义读写执行权限）
+ * @pages: 要映射的物理页面数组（每个元素指向一个 struct page）
+ * @page_shift: 页大小的位移值（PAGE_SHIFT=12 表示 4KB，PMD_SHIFT=21 表示 2MB 大页）
+ * @gfp_mask: 内存分配标志（用于可能的页表分配）
+ *
+ * 【功能】这是 vmalloc 的核心映射函数，完成两个关键步骤：
+ * 1. 建立页表映射（写入 PTE 条目）
+ * 2. 刷新 TLB/Cache（确保新映射对所有 CPU 可见）
+ *
+ * 【与公开 API 的区别】
+ * - vmap_pages_range(): 公开 API，固定使用 GFP_KERNEL
+ * - __vmap_pages_range(): 内部实现，允许自定义 gfp_mask
+ *
+ * 【Svvptc 补丁相关】⭐
+ * 第 699 行的 flush_cache_vmap() 是 Svvptc 补丁修改的关键点：
+ * - 旧方案：调用 flush_tlb_kernel_range() → 发送 IPI 到所有 CPU → 所有 CPU 执行 sfence.vma
+ * - 新方案：只设置 new_vmalloc[] 位图 → 延迟到首次访问时处理 → 避免昂贵的 IPI
+ *
+ * 返回: 0 表示成功，负数表示失败（通常是页表分配失败）
+ */
 static int __vmap_pages_range(unsigned long addr, unsigned long end,
 		pgprot_t prot, struct page **pages, unsigned int page_shift,
 		gfp_t gfp_mask)
 {
 	int err;
 
+	/* 【步骤 1】建立页表映射（写入 PTE，但不刷新 TLB）
+	 * 遍历虚拟地址范围，对每个页面：
+	 * - 找到对应的页表项位置（pgd → p4d → pud → pmd → pte）
+	 * - 写入 PTE: set_pte_at(addr, mk_pte(page, prot))
+	 * - 建立虚拟地址到物理页的映射关系
+	 * 
+	 * 注意 "noflush" 后缀：表示只写页表，不刷新 TLB/Cache
+	 * 原因：批量写入后统一刷新效率更高
+	 */
 	err = vmap_pages_range_noflush(addr, end, prot, pages, page_shift, gfp_mask);
+	
+	/* 【步骤 2】刷新 TLB/Cache（确保新映射可见）⭐ Svvptc 补丁修改点
+	 * 
+	 * 为什么需要刷新？
+	 * - 页表已经更新，但其他 CPU 的 TLB 可能还缓存着旧的"无效"状态
+	 * - 如果不刷新，其他 CPU 访问时可能看不到新映射，触发页错误
+	 * 
+	 * Svvptc 优化原理：
+	 * - 传统方式：立即通过 IPI 通知所有 CPU 执行 sfence.vma（开销大）
+	 * - Svvptc 方式：只设置位图标志，延迟到实际访问时按需处理（开销小）
+	 * 
+	 * arch/riscv/include/asm/cacheflush.h:
+	 * 旧定义: #define flush_cache_vmap(s,e) flush_tlb_kernel_range(s,e)
+	 * 新定义: static inline void flush_cache_vmap(...) { new_vmalloc[]=−1ULL; }
+	 */
 	flush_cache_vmap(addr, end);
+	
 	return err;
 }
 
